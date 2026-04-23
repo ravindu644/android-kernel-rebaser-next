@@ -36,8 +36,55 @@ ask_path() {
     done
 }
 
-IFS='|' read -r ACK_PATH ACK_VER <<< "$(ask_path "ACK")"
-IFS='|' read -r OEM_PATH _       <<< "$(ask_path "OEM" "$ACK_VER")"
+usage() {
+    echo "Usage: $0 [options]"
+    echo "Options:"
+    echo "  --ack <path>    Path to ACK kernel source"
+    echo "  --oem <path>    Path to OEM kernel source"
+    echo "  --depth <num>   Sync depth (number or 'deepest', default: 1)"
+    echo "  -h, --help      Show this help"
+    exit 1
+}
+
+# Default values
+ACK_PATH=""
+OEM_PATH=""
+DEPTH=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ack) ACK_PATH="$2"; shift 2 ;;
+        --oem) OEM_PATH="$2"; shift 2 ;;
+        --depth) DEPTH="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) warn "Unknown option: $1"; usage ;;
+    esac
+done
+
+if [[ -n "$ACK_PATH" && -n "$OEM_PATH" ]]; then
+    ACK_PATH=$(realpath -m "$ACK_PATH")
+    OEM_PATH=$(realpath -m "$OEM_PATH")
+    [[ -d "$ACK_PATH" ]] || die "ACK path is not a directory"
+    [[ -d "$OEM_PATH" ]] || die "OEM path is not a directory"
+    ACK_VER=$(get_kver "$ACK_PATH") || die "ACK: Missing/unreadable Makefile"
+    OEM_VER=$(get_kver "$OEM_PATH") || die "OEM: Missing/unreadable Makefile"
+    [[ "$ACK_VER" == "$OEM_VER" ]] || die "Version mismatch: ACK=$ACK_VER, OEM=$OEM_VER"
+    info "ACK -> $ACK_PATH [$ACK_VER]"
+    info "OEM -> $OEM_PATH [$OEM_VER]"
+else
+    # Fallback to interactive
+    IFS='|' read -r ACK_PATH ACK_VER <<< "$(ask_path "ACK")"
+    IFS='|' read -r OEM_PATH _       <<< "$(ask_path "OEM" "$ACK_VER")"
+    read -rp "Sync depth (number or 'deepest') [1]: " DEPTH
+    [[ -z "$DEPTH" ]] && DEPTH=1
+fi
+
+if [[ "$DEPTH" == "deepest" ]]; then
+    info "Calculating maximum depth..."
+    # Find true maximum depth
+    DEPTH=$(find "$OEM_PATH" -type d -printf '%d\n' | sort -rn | head -1)
+    info "Deepest level found: $DEPTH"
+fi
 
 ACK_NAME=$(basename "$ACK_PATH")
 REBASED="${ACK_PATH%/*}/${ACK_NAME}-rebased"
@@ -57,31 +104,48 @@ git config core.fileMode false
 # init fresh repo if ACK had no .git
 git rev-parse --git-dir &>/dev/null || { git init -q && git add -Af && git commit -q -m "ack: baseline $ACK_VER"; }
 
-# root-level files only (no dirs, no .git)
-info "Syncing OEM root files ..."
+# 1. Sync root files at depth 0
+info "Syncing OEM root files..."
 $RSYNC --delete --exclude='.git' --exclude='*/' "$OEM_PATH/" "$REBASED/"
 git add -Af
 git diff --cached --quiet || git commit -q -m "root: OEM root-level changes"
 
-# union of top-level dirs from both OEM and REBASED
-declare -A ALL_DIRS
-while IFS= read -r -d '' d; do
-    [[ $(basename "$d") == '.git' ]] && continue
-    ALL_DIRS["$(basename "$d")"]=1
-done < <(find "$OEM_PATH" "$REBASED" -maxdepth 1 -mindepth 1 -type d -print0)
+# 2. Iterate through levels BOTTOM-UP (Deepest First)
+for (( i=DEPTH; i>=1; i-- )); do
+    info "Processing Level $i ..."
+    
+    declare -A LEVEL_DIRS
+    while IFS= read -r -d '' d; do
+        rel_path="${d#$OEM_PATH/}"
+        rel_path="${rel_path#$REBASED/}"
+        [[ "$rel_path" == "." || "$rel_path" == ".git"* ]] && continue
+        LEVEL_DIRS["$rel_path"]=1
+    done < <(find "$OEM_PATH" "$REBASED" -mindepth "$i" -maxdepth "$i" -type d -not -path '*/.*' -print0)
 
-for dname in $(echo "${!ALL_DIRS[@]}" | tr ' ' '\n' | sort); do
-    [[ "$dname" == '.git' ]] && continue
-    info "Syncing ${dname}/ ..."
-    if [[ -d "$OEM_PATH/$dname" ]]; then
-        mkdir -p "$REBASED/$dname"
-        $RSYNC --delete --exclude='.git' "$OEM_PATH/$dname/" "$REBASED/$dname/"
-    else
-        # dir exists in ACK but OEM removed it
-        rm -rf "${REBASED:?}/$dname"
-    fi
-    git add -Af "$dname"
-    git diff --cached --quiet || git commit -q -m "${dname}: OEM changes"
+    mapfile -t SORTED_DIRS < <(printf '%s\n' "${!LEVEL_DIRS[@]}" | sort)
+
+    for rel_d in "${SORTED_DIRS[@]}"; do
+        # In bottom-up mode, we sync the directory RECURSIVELY.
+        # But we must exclude sub-directories that were ALREADY committed.
+        # However, to keep it simple: we sync the dir and its files. 
+        # Since sub-dirs are already committed, git will see no changes there.
+        # We just need to ensure we don't 'delete' files that should be there.
+        
+        if [[ -d "$OEM_PATH/$rel_d" ]]; then
+            info "  Syncing $rel_d/ ..."
+            mkdir -p "$REBASED/$rel_d"
+            $RSYNC --delete --exclude='.git' --exclude='*/' "$OEM_PATH/$rel_d/" "$REBASED/$rel_d/"
+            (cd "$REBASED/$rel_d" && git add -Af .)
+        else
+            # OEM deleted it - but only if it's empty (already handled by children)
+            if [[ -e "$REBASED/$rel_d" ]]; then
+                 rm -rf "$REBASED/$rel_d"
+                 git add -u "$rel_d"
+            fi
+        fi
+        
+        git diff --cached --quiet || git commit -q -m "${rel_d}: OEM changes"
+    done
 done
 
 info "Done -> $REBASED"
